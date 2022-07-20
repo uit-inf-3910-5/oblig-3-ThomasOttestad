@@ -1,63 +1,98 @@
 module Server
 
+open System
+open System.IO
+open System.Threading.Tasks
+
+open Microsoft.AspNetCore
 open Microsoft.AspNetCore.Http
+open Microsoft.AspNetCore.Builder
+open Microsoft.AspNetCore.Hosting
+open Microsoft.Extensions.DependencyInjection
+
+
 open FSharp.Control.Tasks.V2
+open Thoth.Json.Net
 open Saturn
 open Giraffe
-
 open Shared
 
-type Storage() =
-    let todos = ResizeArray<_>()
 
-    member __.GetTodos() = List.ofSeq todos
+let tryGetEnv = System.Environment.GetEnvironmentVariable >> function null | "" -> None | x -> Some x
 
-    member __.AddTodo(todo: Todo) =
-        if Todo.isValid todo.Description then
-            todos.Add todo
-            Ok()
-        else
-            Error "Invalid todo"
+let publicPath = Path.GetFullPath "../Client/public"
 
-let storage = Storage()
+let port = 
+    "SERVER_PORT"
+    |> tryGetEnv |> Option.map uint16 |> Option.defaultValue 8085us
 
-storage.AddTodo(Todo.create "Create new project")
-|> ignore
+let dataFile = 
+    __SOURCE_DIRECTORY__ + "/data.json"
 
-storage.AddTodo(Todo.create "Write your app")
-|> ignore
 
-storage.AddTodo(Todo.create "Ship it !!!")
-|> ignore
-
-let private getTodos next ctx =
+let handleGetModel next (ctx : HttpContext) = 
+    let data = System.IO.File.ReadAllText dataFile
+    let decoder = Decode.Auto.generateDecoder<Todo> ()
     task {
-        let todos = storage.GetTodos ()
-        return! json todos next ctx
+        match Decode.fromString decoder data with
+        | Ok temp -> return! json temp next ctx
+        | Error err -> return! RequestErrors.BAD_REQUEST (text err) next ctx
     }
 
-let private addTodo (next: HttpFunc) (ctx: HttpContext) =
+let handleAddModel next (ctx : HttpContext) =
+    let txt = System.IO.File.ReadAllText dataFile
+    let decoder = Decode.Auto.generateDecoder<Todo> ()
+    let people = 
+        match Decode.fromString decoder txt with
+        | Ok p -> p
+        | Error _ -> Todo.New
     task {
-        let! todo = ctx.BindJsonAsync<Todo> ()
-        match storage.AddTodo todo with
-        | Ok () -> return! json todo next ctx
-        | Error e -> return! RequestErrors.BAD_REQUEST "fail" next ctx
+        try 
+            let! data = ctx.BindJsonAsync<Todo> ()
+            let p = Encode.Auto.toString (4, (data))
+            System.IO.File.WriteAllText(dataFile, p)
+            return! json data next ctx
+        with exn ->
+            return! RequestErrors.BAD_REQUEST (text exn.Message) next ctx
     }
 
-let webApp =
+
+
+let handleResetServer next (ctx : HttpContext) = 
+    System.IO.File.WriteAllText(dataFile, "")
+
+    let data = System.IO.File.ReadAllText dataFile
+    let decoder = Decode.Auto.generateDecoder<Todo> ()
+    task {
+        match Decode.fromString decoder data with
+        | Ok temp -> return! json temp next ctx
+        | Error err -> return! RequestErrors.BAD_REQUEST (text err) next ctx
+    }
+
+let webApp = 
     choose [
-        GET >=> route "/api/getTodos" >=> getTodos
-        POST >=> route "/api/addTodo" >=> addTodo
+        GET >=> route "/api/model" >=> handleGetModel
+        POST >=> route "/api/model" >=> handleAddModel
+        DELETE >=> route "/api/reset" >=> handleResetServer
     ]
 
-let app =
-    application {
-        url "http://0.0.0.0:8085"
-        use_router webApp
-        memory_cache
-        use_static "public"
-        use_json_serializer(Thoth.Json.Giraffe.ThothSerializer())
-        use_gzip
-    }
+let jsonSerializer = Thoth.Json.Giraffe.ThothSerializer ()
 
-run app
+let configureServices (services : IServiceCollection) = 
+    services.AddGiraffe() |> ignore
+    services.AddSingleton<Serialization.Json.IJsonSerializer>(jsonSerializer) |> ignore
+
+let configureApp (app : IApplicationBuilder) = 
+    app.UseDefaultFiles()
+        .UseStaticFiles()
+        .UseGiraffe webApp
+
+WebHost 
+    .CreateDefaultBuilder()
+    .UseWebRoot(publicPath)
+    .UseContentRoot(publicPath)
+    .Configure(Action<IApplicationBuilder> configureApp)
+    .ConfigureServices(configureServices)
+    .UseUrls("http://0.0.0.0:" + port.ToString() + "/")
+    .Build()
+    .Run()
